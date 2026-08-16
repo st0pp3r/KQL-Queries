@@ -1,0 +1,51 @@
+// https://st0pp3r.blog/threat-hunting-using-pair-probabilities/
+
+let pair_probabilities_ext_fl = (tbl:(*), A_col:string, B_col:string, scope_col:string, cxt_col_C:string, cxt_col_D:string)
+{
+let T = materialize(tbl | extend _A = column_ifexists(A_col, ""), _B = column_ifexists(B_col, ""), _scope = column_ifexists(scope_col, ""), cxt_col_C = column_ifexists(cxt_col_C, ""), cxt_col_D = column_ifexists(cxt_col_D, "") | project _A, _B, _scope, cxt_col_C, cxt_col_D);
+let countOnScope = T | summarize countAllOnScope = count() by _scope;
+let countABOnScope = T | summarize c = count() by _A, _B, _scope | extend Occurrences = bag_pack(_B, c) | summarize A_B_Occurrences = make_bag(Occurrences) by _A, _scope | mv-apply A_B_Occurrences on (extend bag_as_array = bag_keys(A_B_Occurrences) | mv-expand key = bag_as_array | extend value = toint(A_B_Occurrences[tostring(key)]) | top 10 by value desc | summarize A_B_Occurrences = make_bag(pack(tostring(key), value)));
+let countBAOnScope = T | summarize c = count() by _A, _B, _scope | extend Occurrences = bag_pack(_A, c) | summarize B_A_Occurrences = make_bag(Occurrences) by _B, _scope | mv-apply B_A_Occurrences on (extend bag_as_array = bag_keys(B_A_Occurrences) | mv-expand key = bag_as_array | extend value = toint(B_A_Occurrences[tostring(key)]) | top 10 by value desc | summarize B_A_Occurrences = make_bag(pack(tostring(key), value)));
+let cxtCVals = T | summarize cxtCVals = make_set(cxt_col_C) by _A, _B, _scope;
+let cxtDVals = T | summarize cxtDVals = make_set(cxt_col_D) by _A, _B, _scope;
+let probAB = T | summarize countAB = count() by _A, _B, _scope | join kind = leftouter (countOnScope) on _scope | extend P_AB = todouble(countAB)/countAllOnScope;
+let probA  = probAB | summarize countA = sum(countAB), countAllOnScope = max(countAllOnScope) by _A, _scope | extend P_A = todouble(countA)/countAllOnScope;
+let probB  = probAB | summarize countB = sum(countAB), countAllOnScope = max(countAllOnScope) by _B, _scope | extend P_B = todouble(countB)/countAllOnScope;
+probAB
+| join kind = leftouter (probA) on _A, _scope
+| join kind = leftouter (probB) on _B, _scope
+| join kind = leftouter (countABOnScope) on _A, _scope
+| join kind = leftouter (countBAOnScope) on _B, _scope
+| join kind = leftouter (cxtCVals) on _A, _B, _scope
+| join kind = leftouter (cxtDVals) on _A, _B, _scope
+| extend P_AUB = P_A + P_B - P_AB
+       , P_AIB = P_AB/P_B
+       , P_BIA = P_AB/P_A
+| extend Lift_AB = P_AB/(P_A * P_B)
+       , Jaccard_AB = P_AB/P_AUB
+| project _A, _B, _scope, bin(P_A, 0.00001), bin(P_B, 0.00001), bin(P_AB, 0.00001), bin(P_AUB, 0.00001), bin(P_AIB, 0.00001)
+, bin(P_BIA, 0.00001), bin(Lift_AB, 0.00001), bin(Jaccard_AB, 0.00001), A_B_Occurrences, B_A_Occurrences, countA, countB, cxtCVals, cxtDVals
+| sort by _scope, _A, _B
+};
+let SuspiciousBinaries = dynamic([
+    "net1.exe","net.exe","whoami.exe","arp.exe","netstat.exe","nltest.exe","query.exe","tasklist.exe","hostname.exe","systeminfo.exe","qprocess.exe","ping.exe","qwinsta.exe","nslookup.exe","nbtstat.exe",
+    "certutil.exe","cmd.exe","powershell.exe","powershell_ise.exe","pwsh.exe","mshta.exe","rundll32.exe","regsvr32.exe","wscript.exe","cscript.exe","bitsadmin.exe","msiexec.exe","schtasks.exe","wmic.exe","msbuild.exe","reg.exe","netsh.exe",
+    "svchost.exe","explorer.exe","lsass.exe","msdtc.exe","wuauclt.exe","trustedinstaller.exe","audiodg.exe","dllhost.exe","w3wp.exe","conhost.exe",
+    "microsoftedge.exe","winword.exe","excel.exe","powerpnt.exe"
+]);
+DeviceProcessEvents
+| where ActionType == "ProcessCreated"
+| where FileName in~ (SuspiciousBinaries)
+| extend FileName = tolower(FileName), FolderPath = tolower(FolderPath)
+| where FolderPath != ""
+| extend FolderPath=replace_regex(FolderPath, @"^(\S:\\users\\)(.+?)\\(.*)$", @"\1<user>\\\3")
+| extend FolderPath=replace_regex(FolderPath, @"^(\\device\\.+?)(\\windows.+)$", @"\device\2")
+| extend FolderPath=replace_regex(FolderPath, @"^(.+?)(\\[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}\\)(.*)$", @"\1\\<uuid>\\\3")
+| extend FolderPath = replace_regex(FolderPath, @"\\[A-Za-z0-9]+\.tmp", @"\\<random>.tmp")
+| extend FolderPath = replace_regex(FolderPath, @"[0-9]{3,}", @"<random_num>")
+| extend FolderPath = replace_regex(FolderPath, @"^(?:\S:|\\Device(?:\\HarddiskVolume\d+)?)", "")
+| project DeviceName, FileName, FolderPath = tostring(parse_path(FolderPath).DirectoryPath)
+| invoke pair_probabilities_ext_fl("FolderPath", "FileName", "", "DeviceName", "")
+| project _A, _B, P_AIB, P_BIA, A_B_Occurrences, B_A_Occurrences, cxtCVals
+| where not (_A startswith @"\windows\syswow64") and not (_A startswith @"\windows\system32") and not (_A startswith @"\program files")
+| sort by P_AIB asc
